@@ -118,6 +118,15 @@ def get_tk_hwnd(root) -> int:
     return candidates[0] if candidates else 0
 
 
+# keyboard パッケージでの呼び名が表示名と違うキー
+_KEYBOARD_LIB_NAMES = {
+    "PageUp": "page up",
+    "PageDown": "page down",
+    "PrintScreen": "print screen",
+    "ScrollLock": "scroll lock",
+}
+
+
 def vk_mod_to_combo(vk: int, modifiers: int) -> str:
     parts: list[str] = []
     if modifiers & win32con.MOD_CONTROL:
@@ -126,7 +135,11 @@ def vk_mod_to_combo(vk: int, modifiers: int) -> str:
         parts.append("alt")
     if modifiers & win32con.MOD_SHIFT:
         parts.append("shift")
-    parts.append(vk_name(vk).lower())
+    name = vk_name(vk)
+    if name.startswith("Num") and name[3:].isdigit():
+        parts.append(f"num {name[3:]}")
+    else:
+        parts.append(_KEYBOARD_LIB_NAMES.get(name, name.lower()))
     return "+".join(parts)
 
 
@@ -196,7 +209,11 @@ class KeyboardHotkey:
 
 
 class DualHotkey:
-    """RegisterHotKey（スレッド）+ keyboard フックを同時登録。ゲーム中でも反応しやすい。"""
+    """RegisterHotKey（スレッド）を優先し、登録できない時だけ keyboard フックを使う。
+
+    keyboard の低レベルフックは全キー入力を Python 経由にして入力遅延の原因になるため、
+    RegisterHotKey が成功した場合は張らない。
+    """
 
     def __init__(self, vk: int, modifiers: int, callback):
         self.vk = vk
@@ -219,15 +236,12 @@ class DualHotkey:
 
     def start(self) -> bool:
         self._thread_ok = self._thread.start()
-        self._keyboard_ok = self._keyboard.start(suppress=True)
+        self._keyboard_ok = False if self._thread_ok else self._keyboard.start()
         self._registered = self._thread_ok or self._keyboard_ok
         if self._thread_ok:
             self.vk = self._thread.vk
             self.modifiers = self._thread.modifiers
-            parts = ["thread"]
-            if self._keyboard_ok:
-                parts.append("keyboard")
-            self._backend = "+".join(parts)
+            self._backend = "thread"
         elif self._keyboard_ok:
             self.vk = self._keyboard.vk
             self.modifiers = self._keyboard.modifiers
@@ -467,7 +481,7 @@ def _error_label(err: int) -> str:
 
 
 def _hotkey_attempts(vk: int, modifiers: int) -> list[tuple[int, int, str]]:
-    """登録を試すキー組み合わせ。修飾キーなしはゲームと競合しやすいので Ctrl 付きを先に試す。"""
+    """登録を試すキー組み合わせ。指定キーを最優先し、登録できない時だけ代替へ進む。"""
     seen: set[tuple[int, int]] = set()
     out: list[tuple[int, int, str]] = []
 
@@ -477,11 +491,9 @@ def _hotkey_attempts(vk: int, modifiers: int) -> list[tuple[int, int, str]]:
             seen.add(key)
             out.append((v, m, label))
 
-    if modifiers:
-        add(vk, modifiers, "指定キー")
-    else:
+    add(vk, modifiers, "指定キー")
+    if not modifiers:
         add(vk, win32con.MOD_CONTROL, "Ctrl 付き")
-        add(vk, 0, "指定キー")
     add(0x79, win32con.MOD_CONTROL, "Ctrl+F10")
     return out
 
@@ -492,7 +504,7 @@ def try_register_hotkey(
     modifiers: int,
     callback,
 ) -> tuple[DualHotkey | KeyboardHotkey | TkHotkey | ThreadHotkey | None, str]:
-    """DualHotkey（thread+keyboard）→ Tk HWND の順で試す。"""
+    """DualHotkey（thread、不可なら keyboard）→ Tk HWND の順で試す。"""
     errors: list[str] = []
 
     for v, m, label in _hotkey_attempts(vk, modifiers):
@@ -516,30 +528,55 @@ def try_register_hotkey(
     return None, " / ".join(errors[:4])
 
 
+# Shift / Ctrl / Alt / Win / CapsLock 自体（単独ではホットキーにしない）
+MODIFIER_VKS = frozenset({0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5})
+
+_VK_NAMES = {
+    0x13: "Pause",
+    0x20: "Space",
+    0x21: "PageUp",
+    0x22: "PageDown",
+    0x23: "End",
+    0x24: "Home",
+    0x25: "Left",
+    0x26: "Up",
+    0x27: "Right",
+    0x28: "Down",
+    0x2C: "PrintScreen",
+    0x2D: "Insert",
+    0x2E: "Delete",
+    0x91: "ScrollLock",
+}
+
+# 修飾キーなしでも普段の入力を邪魔しにくいキー
+_STANDALONE_VKS = frozenset({0x13, 0x2C, 0x91})
+
+
 def vk_name(vk: int) -> str:
-    names = {
-        0x70: "F1",
-        0x71: "F2",
-        0x72: "F3",
-        0x73: "F4",
-        0x74: "F5",
-        0x75: "F6",
-        0x76: "F7",
-        0x77: "F8",
-        0x78: "F9",
-        0x79: "F10",
-        0x7A: "F11",
-        0x7B: "F12",
-    }
-    return names.get(vk, f"VK={vk}")
+    if 0x70 <= vk <= 0x87:
+        return f"F{vk - 0x6F}"
+    if 0x30 <= vk <= 0x39 or 0x41 <= vk <= 0x5A:
+        return chr(vk)
+    if 0x60 <= vk <= 0x69:
+        return f"Num{vk - 0x60}"
+    return _VK_NAMES.get(vk, f"VK={vk}")
+
+
+def is_standalone_key(vk: int) -> bool:
+    """修飾キーなしでホットキーにしてよいキーか（F キー・Pause など）。"""
+    return 0x70 <= vk <= 0x87 or vk in _STANDALONE_VKS
+
+
+def combo_label(vk: int, mod: int) -> str:
+    return f"{mod_label(mod)}+{vk_name(vk)}".strip("+")
 
 
 def mod_label(mod: int) -> str:
     parts = []
-    if mod & win32con.MOD_ALT:
-        parts.append("Alt")
     if mod & win32con.MOD_CONTROL:
         parts.append("Ctrl")
+    if mod & win32con.MOD_ALT:
+        parts.append("Alt")
     if mod & win32con.MOD_SHIFT:
         parts.append("Shift")
     return "+".join(parts) if parts else ""

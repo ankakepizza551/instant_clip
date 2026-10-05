@@ -68,13 +68,8 @@ def save_icons() -> None:
     base = create_app_icon(256)
     base.save(ICON_PNG, format="PNG")
     sizes = [(16, 16), (24, 24), (32, 32), (48, 48), (64, 64), (128, 128), (256, 256)]
-    icons = [create_app_icon(s).convert("RGBA") for s, _ in sizes]
-    icons[0].save(
-        ICON_ICO,
-        format="ICO",
-        sizes=sizes,
-        append_images=icons[1:],
-    )
+    # ICO は元画像より大きいサイズを含められないので、最大サイズの画像から書き出す
+    base.save(ICON_ICO, format="ICO", sizes=sizes)
     print(f"Generated: {ICON_ICO}, {ICON_PNG}")
 
 

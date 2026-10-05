@@ -1,11 +1,14 @@
 """リプレイバッファ: 映像セグメント + 音声リングバッファ。"""
 
 import os
+import shutil
 import subprocess
 import tempfile
 import threading
 import time
 import wave
+from array import array
+from collections import deque
 from datetime import datetime
 from pathlib import Path
 from typing import Callable
@@ -25,7 +28,6 @@ from ffmpeg_util import (
     build_encode_plans,
     encoder_extra_args,
     find_ffmpeg,
-    get_loopback_devices,
     WASAPI_PREFIX,
 )
 
@@ -35,25 +37,49 @@ ABOVE_NORMAL_PRIORITY_CLASS = 0x00008000
 class AudioRingBuffer:
     """WASAPI ループバック PCM を時間付きで保持する。"""
 
+    # ループバックは無音中にデータが来ない。これ以上の途切れは無音で埋める
+    _GAP_THRESHOLD = 0.1
+    # 16bit でこれ未満の振幅しか無ければ無音とみなす（約 -72dB）
+    SILENT_PEAK = 8
+
     def __init__(self, buffer_seconds: float):
         self.buffer_seconds = buffer_seconds
-        self._chunks: list[tuple[float, bytes]] = []
+        self._chunks: deque[tuple[float, bytes]] = deque()
         self._lock = threading.Lock()
         self.sample_rate = 48000
         self.channels = 2
         self._started = False
+        self.last_peak = 0
 
     def add(self, t: float, data: bytes) -> None:
         with self._lock:
             self._chunks.append((t, data))
             cutoff = t - self.buffer_seconds
-            self._chunks = [(ts, d) for ts, d in self._chunks if ts >= cutoff]
+            while self._chunks and self._chunks[0][0] < cutoff:
+                self._chunks.popleft()
 
     def write_wav(self, path: Path, start: float, end: float) -> bool:
         with self._lock:
-            pcm = b"".join(d for ts, d in self._chunks if start <= ts <= end)
-        if len(pcm) < 4:
+            chunks = [(ts, d) for ts, d in self._chunks if start <= ts <= end]
+        if not chunks:
             return False
+        # チャンクの時刻は受信完了時刻。start からの経過と書き込み済み量を比べ、
+        # 途切れた分だけ無音を挿入して映像とのズレを防ぐ
+        frame_bytes = self.channels * 2
+        bytes_per_sec = self.sample_rate * frame_bytes
+        parts: list[bytes] = []
+        written = 0
+        for ts, data in chunks:
+            gap = (ts - len(data) / bytes_per_sec) - (start + written / bytes_per_sec)
+            if gap > self._GAP_THRESHOLD:
+                silence = int(gap * self.sample_rate) * frame_bytes
+                parts.append(bytes(silence))
+                written += silence
+            parts.append(data)
+            written += len(data)
+        pcm = b"".join(parts)
+        samples = array("h", pcm[: len(pcm) // 2 * 2])
+        self.last_peak = max(max(samples), -min(samples)) if samples else 0
         with wave.open(str(path), "wb") as wf:
             wf.setnchannels(self.channels)
             wf.setsampwidth(2)
@@ -78,6 +104,7 @@ class ReplayBuffer:
         preset: str,
         audio_device: str | None,
         log: Callable[[str], None] = print,
+        monitor: str = "all",
     ):
         self.buffer_seconds = max(3, min(120, buffer_seconds))
         self.capture_mode = capture_mode
@@ -87,6 +114,7 @@ class ReplayBuffer:
         self.preset = preset
         self.audio_device = audio_device
         self.log = log
+        self.monitor = monitor
 
         self._segment_dir = Path(tempfile.mkdtemp(prefix="instant_clip_"))
         self._proc: subprocess.Popen | None = None
@@ -105,6 +133,7 @@ class ReplayBuffer:
         self._save_busy = threading.Lock()
         self._capture_epoch = 0
         self._active_epoch = 0
+        self._epoch_size: dict[int, tuple[int, int]] = {}
 
     @property
     def is_running(self) -> bool:
@@ -125,6 +154,7 @@ class ReplayBuffer:
             self.game_exe,
             log=self.log,
             gfxcapture_available=False,
+            monitor=self.monitor,
         )
         self._capture_ok = self._start_video_capture(ffmpeg)
         if not self._capture_ok:
@@ -157,7 +187,7 @@ class ReplayBuffer:
             self._stderr_file = None
 
         if self._audio_thread and self._audio_thread.is_alive():
-            self._audio_thread.join(timeout=5)
+            self._audio_thread.join(timeout=2)
         self._audio_thread = None
 
         for th in (self._cleanup_thread, self._region_thread):
@@ -166,12 +196,11 @@ class ReplayBuffer:
         self._cleanup_thread = None
         self._region_thread = None
 
-        if self._segment_dir.exists():
-            self._cleanup_segments(force_all=True)
-            try:
-                self._segment_dir.rmdir()
-            except Exception:
-                pass
+        # 保存処理が結合中なら、終わるのを待ってから一時フォルダを消す
+        waited = self._save_busy.acquire(timeout=30)
+        shutil.rmtree(self._segment_dir, ignore_errors=True)
+        if waited:
+            self._save_busy.release()
 
         if was_active:
             self.log("バッファ停止")
@@ -263,13 +292,6 @@ class ReplayBuffer:
                     selected.add(f)
         return sorted(selected, key=lambda f: (f.stat().st_mtime, f.name))
 
-    def _delete_segment_files(self, files: list[Path]) -> None:
-        for f in files:
-            try:
-                f.unlink()
-            except Exception:
-                pass
-
     def save_clip(self, output_dir: Path) -> Path | None:
         if not self._running:
             self.log("[警告] バッファが動作していません")
@@ -287,7 +309,6 @@ class ReplayBuffer:
         list_path: Path | None = None
         video_only: Path | None = None
         tmp_final: Path | None = None
-        saved_segments: list[Path] = []
         result_path: Path | None = None
 
         try:
@@ -309,6 +330,11 @@ class ReplayBuffer:
                         self.log("[警告] 保存できる映像がありません（バッファがまだ溜まっていません）")
                         return None
 
+                uniform = self._same_size_tail(video_files)
+                if len(uniform) != len(video_files):
+                    self.log("[診断] 解像度が切り替わった直後のため、切替後の映像のみ保存します")
+                    video_files = uniform
+
                 ensure_dir_user_can_access(output_dir)
                 stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                 final_path = output_dir / f"clip_{stamp}.mp4"
@@ -323,7 +349,6 @@ class ReplayBuffer:
                         lf.write(f"file '{p}'\n")
 
                 video_only = self._segment_dir / f"_concat_{stamp}.mp4"
-                saved_segments = list(video_files)
                 # 音声開始時刻を最初のセグメント内容の開始時刻に合わせる
                 # セグメントの mtime はそのセグメントの書き込み完了時刻（= 内容の終端）
                 # 内容の開始 = mtime - segment_time (0.5s)
@@ -347,7 +372,7 @@ class ReplayBuffer:
                         self._segment_dir / "_clip_audio.wav", audio_start, audio_end
                     )
                 if not has_audio:
-                    self.log("[診断] 指定期間の音声データがありません（VB-Cableに音声が届いていない可能性）")
+                    self.log("[診断] 指定期間の音声データがありません（選択した音声デバイスに音が出ていない可能性）")
 
             if has_audio:
                 wav_path = self._segment_dir / "_clip_audio.wav"
@@ -387,6 +412,12 @@ class ReplayBuffer:
                 if merge_result.returncode == 0 and merged.exists() and merged.stat().st_size > 500:
                     os.replace(str(merged), str(tmp_final))
                     self.log("[診断] 音声マージ成功")
+                    if self._audio_ring.last_peak < AudioRingBuffer.SILENT_PEAK:
+                        device = self.audio_device[len(WASAPI_PREFIX):]
+                        self.log(
+                            f"[警告] 録音された音声が無音でした。「{device}」に音が出ているか、"
+                            "音声デバイスの設定を確認してください"
+                        )
                 else:
                     tail = next(
                         (l.strip() for l in reversed(merge_result.stderr.splitlines()) if l.strip()),
@@ -409,14 +440,31 @@ class ReplayBuffer:
             if tmp_final is not None and tmp_final.exists():
                 tmp_final.unlink(missing_ok=True)
             with self._save_lock:
-                if saved_segments:
-                    self._delete_segment_files(saved_segments)
                 if not self._capture_ok:
                     # フォールバックでffmpegを停止した場合のみ再起動
                     self._resume_capture_after_save(ffmpeg)
             self._save_busy.release()
 
         return result_path
+
+    def _same_size_tail(self, files: list[Path]) -> list[Path]:
+        """最新セグメントと同じ解像度が続く末尾部分だけを返す。
+
+        解像度の違うセグメントを連結すると再生が乱れるため、切替前の分は使わない。
+        """
+        def size(f: Path) -> tuple[int, int] | None:
+            try:
+                return self._epoch_size.get(int(f.name[1:6]))
+            except ValueError:
+                return None
+
+        if not files:
+            return files
+        last = size(files[-1])
+        i = len(files)
+        while i > 0 and size(files[i - 1]) == last:
+            i -= 1
+        return files[i:]
 
     def _proc_alive(self) -> bool:
         return self._proc is not None and self._proc.poll() is None
@@ -539,6 +587,7 @@ class ReplayBuffer:
                 self.capture_mode,
                 self.game_exe,
                 gfxcapture_available=False,
+                monitor=self.monitor,
             )
 
         for target in targets:
@@ -577,6 +626,7 @@ class ReplayBuffer:
                 )
                 segment_pattern = self._next_segment_pattern()
                 self._active_epoch = self._capture_epoch
+                self._epoch_size[self._capture_epoch] = (plan.out_width, plan.out_height)
                 cmd.append(segment_pattern)
 
                 stderr_path = self._segment_dir / "ffmpeg.log"
@@ -703,15 +753,12 @@ class ReplayBuffer:
                         if info.get("name", "") == device_label:
                             device_info = info
                             break
-                    if device_info is None:
-                        for info in pa.get_loopback_device_info_generator():
-                            device_info = info
-                            break
                 except Exception as e:
                     log(f"[警告] ループバック列挙エラー: {e}")
 
                 if device_info is None:
-                    log("[警告] 音声デバイスが見つかりません")
+                    # 別デバイスで代用すると意図しない音（通話等）が入るため録らない
+                    log(f"[警告] 音声デバイス「{device_label}」が見つかりません。音声なしで録画します")
                     pa.terminate()
                     return
 
@@ -741,6 +788,11 @@ class ReplayBuffer:
                 ring.channels = ch
                 log(f"音声キャプチャ: {device_info.get('name', '?')}")
 
+                # 無音中は read() が戻らず停止できないため、コールバックで受け取る
+                def _on_audio(in_data, frame_count, time_info, status):
+                    ring.add(time.time(), in_data)
+                    return (None, pyaudio.paContinue)
+
                 stream = pa.open(
                     format=pyaudio.paInt16,
                     channels=ch,
@@ -748,17 +800,17 @@ class ReplayBuffer:
                     frames_per_buffer=512,
                     input=True,
                     input_device_index=device_index,
+                    stream_callback=_on_audio,
                 )
-                stream.start_stream()
-                while not stop.is_set():
-                    try:
-                        data = stream.read(512, exception_on_overflow=False)
-                        ring.add(time.time(), data)
-                    except Exception:
-                        break
-                stream.stop_stream()
-                stream.close()
-                pa.terminate()
+                try:
+                    stream.start_stream()
+                    while not stop.wait(0.2):
+                        if not stream.is_active():
+                            break
+                finally:
+                    stream.stop_stream()
+                    stream.close()
+                    pa.terminate()
             except ImportError:
                 log("[警告] pyaudiowpatch が必要です: pip install pyaudiowpatch")
             except Exception as e:
@@ -769,13 +821,13 @@ class ReplayBuffer:
 
     def _cleanup_loop(self) -> None:
         while not self._stop_event.wait(2.0):
+            # 保存処理が結合中のセグメントを消さないよう待つ
+            if self._save_busy.locked():
+                continue
             self._cleanup_segments()
 
-    def _cleanup_segments(self, force_all: bool = False) -> None:
-        if force_all:
-            cutoff = time.time() + 1
-        else:
-            cutoff = time.time() - self.buffer_seconds - 2
+    def _cleanup_segments(self) -> None:
+        cutoff = time.time() - self.buffer_seconds - 2
         for f in self._iter_segment_files():
             try:
                 if f.stat().st_mtime < cutoff:
@@ -804,6 +856,7 @@ class ReplayBuffer:
                     self._current_target,
                     self.capture_mode,
                     self.game_exe,
+                    self.monitor,
                 )
                 if new_target is None:
                     continue

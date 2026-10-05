@@ -2,9 +2,11 @@
 
 from dataclasses import dataclass
 import ctypes
+from ctypes import wintypes
 from pathlib import Path
 from typing import Callable
 
+import win32api
 import win32gui
 import win32process
 
@@ -83,7 +85,41 @@ def is_game_running(exe_name: str) -> bool:
     return find_game_hwnd(exe_name) is not None
 
 
-def get_fullscreen_region() -> tuple[int, int, int, int]:
+@dataclass(frozen=True)
+class Monitor:
+    device: str
+    left: int
+    top: int
+    width: int
+    height: int
+    primary: bool
+
+
+def list_monitors() -> list[Monitor]:
+    """接続中のモニタ。メインを先頭に、以降は左から順。"""
+    out: list[Monitor] = []
+    try:
+        for hmon, _, _ in win32api.EnumDisplayMonitors():
+            info = win32api.GetMonitorInfo(hmon)
+            left, top, right, bottom = info["Monitor"]
+            out.append(
+                Monitor(
+                    device=info["Device"],
+                    left=left,
+                    top=top,
+                    width=right - left,
+                    height=bottom - top,
+                    primary=bool(info["Flags"] & 1),
+                )
+            )
+    except Exception:
+        return []
+    out.sort(key=lambda m: (not m.primary, m.left, m.top))
+    return out
+
+
+def get_virtual_screen_bounds() -> tuple[int, int, int, int]:
+    """仮想デスクトップ全体 (left, top, width, height)。"""
     user32 = ctypes.windll.user32
     left = user32.GetSystemMetrics(76)
     top = user32.GetSystemMetrics(77)
@@ -94,9 +130,21 @@ def get_fullscreen_region() -> tuple[int, int, int, int]:
     return left, top, width, height
 
 
-def get_virtual_screen_bounds() -> tuple[int, int, int, int]:
-    """仮想デスクトップ全体 (left, top, width, height)。"""
-    return get_fullscreen_region()
+def get_fullscreen_region(monitor: str = "all") -> tuple[int, int, int, int]:
+    """フルスクリーン録画の領域。monitor は "all" / "primary" / デバイス名。
+
+    指定のモニタが見つからない場合はメインモニタを使う。
+    """
+    if monitor != "all":
+        monitors = list_monitors()
+        chosen = next((m for m in monitors if m.device == monitor), None)
+        if chosen is None:
+            chosen = next((m for m in monitors if m.primary), None)
+        if chosen is not None:
+            width = chosen.width if chosen.width % 2 == 0 else chosen.width - 1
+            height = chosen.height if chosen.height % 2 == 0 else chosen.height - 1
+            return chosen.left, chosen.top, width, height
+    return get_virtual_screen_bounds()
 
 
 def is_valid_gdigrab_region(left: int, top: int, width: int, height: int) -> bool:
@@ -147,7 +195,7 @@ def get_window_client_region(hwnd: int) -> tuple[int, int, int, int] | None:
         if not win32gui.IsWindowVisible(hwnd):
             return None
         cl, ct, cr, cb = win32gui.GetClientRect(hwnd)
-        pt = ctypes.wintypes.POINT(cl, ct)
+        pt = wintypes.POINT(cl, ct)
         ctypes.windll.user32.ClientToScreen(hwnd, ctypes.byref(pt))
         left, top = pt.x, pt.y
         width, height = cr - cl, cb - ct
@@ -208,6 +256,7 @@ def resolve_capture_target(
     game_exe: str,
     log: Callable[[str], None] = print,
     gfxcapture_available: bool = True,
+    monitor: str = "all",
 ) -> CaptureTarget:
     hwnd = find_game_hwnd(game_exe)
     use_window = mode == "game_window" or (mode == "auto" and hwnd)
@@ -232,7 +281,7 @@ def resolve_capture_target(
             )
             return target
 
-    left, top, width, height = get_fullscreen_region()
+    left, top, width, height = get_fullscreen_region(monitor)
     log(
         f"キャプチャ: フルスクリーン {width}x{height} "
         f"(画面上の重なりウィンドウも映ります)"
@@ -253,6 +302,7 @@ def build_capture_fallbacks(
     mode: str,
     game_exe: str,
     gfxcapture_available: bool = True,
+    monitor: str = "all",
 ) -> list[CaptureTarget]:
     """起動時に試すキャプチャ方式の順序（成功した方式をロックする）。"""
     hwnd = find_game_hwnd(game_exe)
@@ -265,7 +315,7 @@ def build_capture_fallbacks(
         if t:
             out.append(t)
 
-    left, top, width, height = get_fullscreen_region()
+    left, top, width, height = get_fullscreen_region(monitor)
     out.append(
         CaptureTarget(
             grabber="gdigrab",
@@ -285,19 +335,25 @@ def refresh_capture_target(
     current: CaptureTarget,
     capture_mode: str,
     game_exe: str,
+    monitor: str = "all",
 ) -> CaptureTarget | None:
-    """監視ループ用: 同じ grabber/mode のまま座標・HWND だけ更新する。"""
+    """監視ループ用: 現在のキャプチャ対象を最新の状態に合わせて返す。
+
+    フルスクリーンで撮っている間にゲームが起動したらゲーム領域へ、
+    auto でゲームが終了したらフルスクリーンへ切り替える。
+    """
     hwnd = find_game_hwnd(game_exe, current.hwnd)
     use_window = capture_mode == "game_window" or (capture_mode == "auto" and hwnd)
 
-    if current.mode in ("hwnd", "window_exe") and use_window and hwnd:
+    if use_window and hwnd:
         title = win32gui.GetWindowText(hwnd)
-        return _game_window_target(
-            hwnd, title, game_exe, current.grabber, current.mode
-        )
+        mode = current.mode if current.mode in ("hwnd", "window_exe") else "region"
+        return _game_window_target(hwnd, title, game_exe, current.grabber, mode)
 
-    if current.mode == "region" and current.label == "fullscreen":
-        left, top, width, height = get_fullscreen_region()
+    if current.mode == "region" and (
+        capture_mode == "auto" or current.label == "fullscreen"
+    ):
+        left, top, width, height = get_fullscreen_region(monitor)
         return CaptureTarget(
             grabber=current.grabber,
             mode="region",
@@ -307,12 +363,6 @@ def refresh_capture_target(
             height=height,
             label="fullscreen",
             game_exe=game_exe,
-        )
-
-    if current.mode == "region" and use_window and hwnd:
-        title = win32gui.GetWindowText(hwnd)
-        return _game_window_target(
-            hwnd, title, game_exe, current.grabber, "region"
         )
 
     return None
@@ -340,12 +390,3 @@ def target_needs_restart(
         return True
     return False
 
-
-# 後方互換
-def resolve_capture_region(
-    mode: str,
-    game_exe: str,
-    log: Callable[[str], None] = print,
-) -> tuple[int, int, int, int]:
-    t = resolve_capture_target(mode, game_exe, log=log)
-    return t.left, t.top, t.width, t.height

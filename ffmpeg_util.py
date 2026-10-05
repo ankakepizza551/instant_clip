@@ -27,29 +27,39 @@ def find_ffmpeg() -> str | None:
     return shutil.which("ffmpeg")
 
 
-def has_ffmpeg_filter(ffmpeg: str, filter_name: str) -> bool:
-    """ffmpeg -filters に指定フィルタが含まれるか。"""
-    try:
-        proc = subprocess.run(
-            [ffmpeg, "-filters"],
-            stdin=subprocess.DEVNULL,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            creationflags=CREATE_NO_WINDOW,
-            timeout=15,
-        )
-        return filter_name in proc.stdout
-    except Exception:
-        return False
-
-
 def _even(n: int) -> int:
     return n if n % 2 == 0 else max(2, n - 1)
 
 
+_HW_ENCODERS = ("h264_nvenc", "h264_amf", "h264_qsv")
+_best_encoder_cache: dict[str, str] = {}
+
+
+def _encoder_usable(ffmpeg: str, encoder: str) -> bool:
+    """実際に 1 フレームエンコードして、この PC で使えるか確かめる。"""
+    try:
+        proc = subprocess.run(
+            [
+                ffmpeg, "-hide_banner", "-loglevel", "error",
+                "-f", "lavfi", "-i", "color=black:s=640x360:r=30",
+                "-frames:v", "1", "-c:v", encoder, "-f", "null", "-",
+            ],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            creationflags=CREATE_NO_WINDOW,
+            timeout=15,
+        )
+        return proc.returncode == 0
+    except Exception:
+        return False
+
+
 def get_best_encoder(ffmpeg: str) -> str:
+    """この PC で実際に動く H.264 エンコーダを返す（結果はキャッシュ）。"""
+    cached = _best_encoder_cache.get(ffmpeg)
+    if cached:
+        return cached
+    best = "libx264"
     try:
         proc = subprocess.run(
             [ffmpeg, "-encoders"],
@@ -60,15 +70,15 @@ def get_best_encoder(ffmpeg: str) -> str:
             errors="replace",
             creationflags=CREATE_NO_WINDOW,
         )
-        if "h264_nvenc" in proc.stdout:
-            return "h264_nvenc"
-        if "h264_amf" in proc.stdout:
-            return "h264_amf"
-        if "h264_qsv" in proc.stdout:
-            return "h264_qsv"
+        # ビルドに含まれていても GPU が無ければ使えないので、試してから決める
+        for encoder in _HW_ENCODERS:
+            if encoder in proc.stdout and _encoder_usable(ffmpeg, encoder):
+                best = encoder
+                break
     except Exception:
         pass
-    return "libx264"
+    _best_encoder_cache[ffmpeg] = best
+    return best
 
 
 @dataclass
@@ -134,6 +144,21 @@ def encoder_extra_args(encoder: str, crf: int, preset: str, framerate: int = 30)
         return ["-preset", "veryfast", "-global_quality", str(crf),
                 "-g", str(kf)]
     return ["-preset", "fast"]
+
+
+def get_default_loopback_device() -> str | None:
+    """既定の出力デバイス（今聞こえている音）のループバック名。"""
+    try:
+        import pyaudiowpatch as pyaudio
+
+        pa = pyaudio.PyAudio()
+        try:
+            name = pa.get_default_wasapi_loopback().get("name", "")
+            return f"{WASAPI_PREFIX}{name}" if name else None
+        finally:
+            pa.terminate()
+    except Exception:
+        return None
 
 
 def get_loopback_devices() -> list[str]:

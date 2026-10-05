@@ -3,9 +3,9 @@ from PyInstaller.utils.hooks import collect_data_files
 from PyInstaller.utils.hooks import collect_all
 from PyInstaller.utils.hooks import copy_metadata
 
-datas = []
+datas = [('icon.ico', '.'), ('icon.png', '.')]
 binaries = [('C:\\Users\\kenta\\AppData\\Local\\Python\\pythoncore-3.14-64\\python314.dll', '.')]
-hiddenimports = ['customtkinter', 'customtkinter.windows.widgets', 'audio_routing', 'file_acl', 'process_util', 'keyboard', 'PIL', 'PIL.Image', 'PIL.ImageDraw', 'pystray']
+hiddenimports = ['customtkinter', 'customtkinter.windows.widgets', 'audio_routing', 'file_acl', 'autostart', 'process_util', 'keyboard', 'PIL', 'PIL.Image', 'PIL.ImageDraw', 'pystray']
 datas += collect_data_files('customtkinter')
 datas += copy_metadata('customtkinter')
 tmp_ret = collect_all('customtkinter')
@@ -47,6 +47,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
+    uac_admin=True,
     icon=['J:\\制作データ\\tools\\instant_clip\\icon.ico'],
     manifest='app.manifest',
 )
