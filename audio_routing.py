@@ -7,8 +7,6 @@ from __future__ import annotations
 import ctypes
 import struct
 
-from ffmpeg_util import WASAPI_PREFIX
-
 _ole32 = ctypes.windll.ole32
 _ole32.CoInitializeEx.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
 _ole32.CoInitializeEx.restype = ctypes.HRESULT
@@ -212,23 +210,6 @@ def find_vbcable() -> tuple[str, str] | None:
         for name, dev_id in devices.items():
             if any(kw in name for kw in _VBCABLE_KEYWORDS):
                 return (name, dev_id)
-    except Exception:
-        pass
-    return None
-
-
-def find_vbcable_loopback_name() -> str | None:
-    try:
-        import pyaudiowpatch as pyaudio
-
-        pa = pyaudio.PyAudio()
-        try:
-            for info in pa.get_loopback_device_info_generator():
-                name = info.get("name", "")
-                if any(kw in name for kw in _VBCABLE_KEYWORDS):
-                    return f"{WASAPI_PREFIX}{name}"
-        finally:
-            pa.terminate()
     except Exception:
         pass
     return None

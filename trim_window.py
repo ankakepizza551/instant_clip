@@ -375,7 +375,9 @@ class TrimWindow(ctk.CTkToplevel):
                     err = next((l.strip() for l in reversed(lines) if l.strip()), "不明なエラー")
                     self.after(0, lambda: self._status_var.set(f"エラー: {err}"))
             except Exception as e:
-                self.after(0, lambda: self._status_var.set(f"エラー: {e}"))
+                # e は except を抜けると消えるので、文字列にしてから渡す
+                err = f"エラー: {e}"
+                self.after(0, lambda: self._status_var.set(err))
             finally:
                 self.after(0, lambda: self._trim_btn.configure(state="normal"))
 

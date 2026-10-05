@@ -1,9 +1,12 @@
 """InstantClip — ホットキーで直前N秒をクリップ保存。"""
 
 import atexit
+import ctypes
 import queue
+import sys
 import threading
 import time
+import winsound
 import tkinter as tk
 from pathlib import Path
 from tkinter import filedialog, messagebox
@@ -12,13 +15,17 @@ import customtkinter as ctk
 import win32con
 
 import audio_routing
+import autostart
 import capture
 import config as cfg_mod
 from buffer import ReplayBuffer
-from ffmpeg_util import find_ffmpeg, get_loopback_devices
+from ffmpeg_util import find_ffmpeg, get_default_loopback_device, get_loopback_devices
 from trim_window import TrimWindow
 from hotkey import (
+    MODIFIER_VKS,
+    combo_label,
     get_tk_hwnd_candidates,
+    is_standalone_key,
     mod_label,
     try_register_hotkey,
     vk_name,
@@ -68,6 +75,8 @@ except ImportError:
 
 APP_TITLE = "InstantClip"
 WIDTH, HEIGHT = 560, 800
+MIN_HEIGHT = 620
+TABS_HEIGHT = 280
 
 ctk.set_appearance_mode("dark")
 ctk.set_default_color_theme("dark-blue")
@@ -84,21 +93,54 @@ except Exception:
 _NO_AUDIO = "なし（音声なし）"
 _VB_KEYWORDS = ("VB-Audio", "CABLE")
 
-HOTKEY_CHOICES = [
-    ("Ctrl+F9 (推奨)", 0x78, win32con.MOD_CONTROL),
-    ("F9", 0x78, 0),
-    ("F10", 0x79, 0),
-    ("F11", 0x7A, 0),
-    ("F12", 0x7B, 0),
-    ("Alt+F9", 0x78, win32con.MOD_ALT),
-    ("Ctrl+F10", 0x79, win32con.MOD_CONTROL),
-]
-
 CAPTURE_MODES = [
     ("自動 (ゲーム優先)", "auto"),
     ("フルスクリーン", "fullscreen"),
     ("ゲームウィンドウ", "game_window"),
 ]
+
+
+NOTIFY_MODES = [
+    ("音", "sound"),
+    ("トレイ通知", "toast"),
+    ("なし", "none"),
+]
+
+# crf（GPU エンコード時は同等の品質値）。小さいほど高画質・大容量
+QUALITY_CHOICES = [
+    ("高画質 (18)", 18),
+    ("標準 (23)", 23),
+    ("軽量 (28)", 28),
+]
+
+# GPU エンコードが使えない時の libx264 プリセット
+PRESET_CHOICES = [
+    ("最軽量 (ultrafast)", "ultrafast"),
+    ("軽量 (superfast)", "superfast"),
+    ("標準 (veryfast)", "veryfast"),
+]
+
+# Tk の KeyPress イベントの state ビット（Windows）
+_TK_SHIFT, _TK_CONTROL, _TK_ALT = 0x1, 0x4, 0x20000
+
+
+def _label_for(choices, value, default=None):
+    return next((label for label, v in choices if v == value), default)
+
+
+def _value_for(choices, label, default):
+    return next((v for l, v in choices if l == label), default)
+
+
+def _monitor_choices() -> list[tuple[str, str]]:
+    """フルスクリーン録画で撮るモニタの選択肢 (表示名, 設定値)。"""
+    out: list[tuple[str, str]] = []
+    for i, m in enumerate(capture.list_monitors(), 1):
+        mark = "・メイン" if m.primary else ""
+        out.append((f"モニタ {i}{mark} ({m.width}x{m.height})", m.device))
+    _, _, width, height = capture.get_virtual_screen_bounds()
+    out.append((f"すべてのモニタ ({width}x{height})", "all"))
+    return out
 
 
 class GameAudioRouter:
@@ -134,13 +176,21 @@ class GameAudioRouter:
                 self._prev_device = None
         self._was_running = running
 
+    def restore(self) -> None:
+        """切替中なら元のデバイスへ戻す（アプリ終了時・自動切替オフ時）。"""
+        if self._prev_device:
+            if audio_routing.set_default_playback_device(self._prev_device):
+                self.log_q.put("音声出力を元のデバイスに復元しました")
+            self._prev_device = None
+        self._was_running = False
+
 
 class InstantClipApp(ctk.CTk):
-    def __init__(self):
+    def __init__(self, start_hidden: bool = False):
         super().__init__()
         self.title(APP_TITLE)
         self.geometry(f"{WIDTH}x{HEIGHT}")
-        self.minsize(WIDTH, HEIGHT)
+        self.minsize(WIDTH, MIN_HEIGHT)
         self.configure(fg_color=BG)
         if ICON_ICO.exists():
             try:
@@ -149,6 +199,9 @@ class InstantClipApp(ctk.CTk):
                 pass
 
         self.cfg = cfg_mod.load()
+        if not self.cfg.get("audio_device_name") and self.cfg.get("game_audio_only"):
+            # 音声デバイス未設定（初回起動）: 今聞こえている音を録る
+            self.cfg["audio_device_name"] = get_default_loopback_device() or ""
         self.log_q: queue.Queue = queue.Queue()
         self.buffer: ReplayBuffer | None = None
         self.hotkey = None
@@ -157,6 +210,9 @@ class InstantClipApp(ctk.CTk):
         self._tray_icon = None
         self._closing = False
         self._last_clip_path: Path | None = None
+        self._hotkey_choice: tuple[int, int] = (self.cfg["hotkey_vk"], self.cfg["hotkey_mod"])
+        self._capturing_hotkey = False
+        self._hotkey_bind_id: str | None = None
         _audio_dev = self.cfg.get("audio_device_name", "")
         _is_vb = any(kw in _audio_dev for kw in _VB_KEYWORDS)
         self._router = GameAudioRouter(
@@ -173,6 +229,8 @@ class InstantClipApp(ctk.CTk):
         if _TRAY_AVAILABLE:
             self._setup_tray()
             self.protocol("WM_DELETE_WINDOW", self._ask_quit_or_tray)
+            if start_hidden:
+                self.withdraw()
         else:
             self.protocol("WM_DELETE_WINDOW", self._on_close)
 
@@ -199,7 +257,7 @@ class InstantClipApp(ctk.CTk):
             if (vk, mod) != (old_vk, old_mod):
                 cfg_mod.save(self.cfg)
                 self._apply_cfg_to_ui()
-                self._log("ゲーム競合回避のためホットキー設定を更新しました")
+                self._log("指定のホットキーを登録できなかったため、設定を更新しました")
             if backend == "register_hotkey":
                 self.after(50, self._poll_hotkey)
             elif backend == "keyboard":
@@ -329,63 +387,97 @@ class InstantClipApp(ctk.CTk):
         )
         self.status_label.pack(side="left", fill="x", expand=True)
 
-        settings = self._card(self)
-        settings.pack(fill="x", padx=PAD, pady=6)
-        settings.columnconfigure(1, weight=1)
+        tabs = ctk.CTkTabview(
+            self,
+            height=TABS_HEIGHT,
+            fg_color=CARD,
+            corner_radius=CORNER,
+            border_width=1,
+            border_color=BORDER,
+            segmented_button_fg_color=CARD_ALT,
+            segmented_button_selected_color=ACCENT,
+            segmented_button_selected_hover_color=ACCENT_HOVER,
+            segmented_button_unselected_color=CARD_ALT,
+            segmented_button_unselected_hover_color=SECONDARY,
+            text_color=TEXT,
+        )
+        tabs.pack(fill="x", padx=PAD, pady=6)
+        basic = tabs.add("基本")
+        video = tabs.add("映像")
+        audio = tabs.add("音声")
+        for tab in (basic, video, audio):
+            tab.columnconfigure(1, weight=1)
 
-        cell = {"padx": 12, "pady": 6}
+        cell = {"padx": 12, "pady": 5}
         lbl_style = {"font": self._font(12), "text_color": MUTED}
 
-        ctk.CTkLabel(settings, text="バッファ秒数", **lbl_style).grid(
-            row=0, column=0, sticky="w", **cell
-        )
-        self.buffer_spin = ctk.CTkEntry(
-            settings, width=90, height=32, corner_radius=CORNER_SM,
-            fg_color=CARD_ALT, border_color=BORDER, text_color=TEXT,
-        )
-        self.buffer_spin.grid(row=0, column=1, sticky="w", **cell)
+        def add_label(parent, text: str, row: int) -> None:
+            ctk.CTkLabel(parent, text=text, **lbl_style).grid(
+                row=row, column=0, sticky="w", **cell
+            )
 
-        ctk.CTkLabel(settings, text="ホットキー", **lbl_style).grid(
-            row=1, column=0, sticky="w", **cell
-        )
-        self.hotkey_menu = ctk.CTkOptionMenu(
-            settings,
-            values=[x[0] for x in HOTKEY_CHOICES],
-            width=220,
+        def add_entry(parent, row: int) -> ctk.CTkEntry:
+            entry = ctk.CTkEntry(
+                parent, width=90, height=32, corner_radius=CORNER_SM,
+                fg_color=CARD_ALT, border_color=BORDER, text_color=TEXT,
+            )
+            entry.grid(row=row, column=1, sticky="w", **cell)
+            return entry
+
+        def add_menu(parent, values: list[str], row: int, sticky: str = "w") -> ctk.CTkOptionMenu:
+            menu = ctk.CTkOptionMenu(
+                parent,
+                values=values,
+                width=240,
+                height=32,
+                corner_radius=CORNER_SM,
+                fg_color=CARD_ALT,
+                button_color=SECONDARY,
+                button_hover_color=BORDER,
+                dropdown_fg_color=CARD,
+                dropdown_hover_color=SECONDARY,
+                text_color=TEXT,
+            )
+            menu.grid(row=row, column=1, sticky=sticky, **cell)
+            return menu
+
+        def add_check(parent, text: str, row: int) -> ctk.CTkCheckBox:
+            chk = ctk.CTkCheckBox(
+                parent,
+                text=text,
+                font=self._font(12),
+                text_color=TEXT,
+                fg_color=ACCENT,
+                hover_color=ACCENT_HOVER,
+                border_color=BORDER,
+            )
+            chk.grid(row=row, column=0, columnspan=2, sticky="w", padx=12, pady=(8, 4))
+            return chk
+
+        # ── 基本
+        add_label(basic, "バッファ秒数", 0)
+        self.buffer_spin = add_entry(basic, 0)
+
+        add_label(basic, "ホットキー", 1)
+        self.hotkey_btn = ctk.CTkButton(
+            basic,
+            text="",
+            width=240,
             height=32,
             corner_radius=CORNER_SM,
+            font=self._font(12),
             fg_color=CARD_ALT,
-            button_color=SECONDARY,
-            button_hover_color=BORDER,
-            dropdown_fg_color=CARD,
-            dropdown_hover_color=SECONDARY,
+            hover_color=SECONDARY,
             text_color=TEXT,
+            border_width=1,
+            border_color=BORDER,
+            command=self._begin_hotkey_capture,
         )
-        self.hotkey_menu.grid(row=1, column=1, sticky="w", **cell)
+        self.hotkey_btn.grid(row=1, column=1, sticky="w", **cell)
 
-        ctk.CTkLabel(settings, text="キャプチャ", **lbl_style).grid(
-            row=2, column=0, sticky="w", **cell
-        )
-        self.capture_menu = ctk.CTkOptionMenu(
-            settings,
-            values=[x[0] for x in CAPTURE_MODES],
-            width=220,
-            height=32,
-            corner_radius=CORNER_SM,
-            fg_color=CARD_ALT,
-            button_color=SECONDARY,
-            button_hover_color=BORDER,
-            dropdown_fg_color=CARD,
-            dropdown_hover_color=SECONDARY,
-            text_color=TEXT,
-        )
-        self.capture_menu.grid(row=2, column=1, sticky="w", **cell)
-
-        ctk.CTkLabel(settings, text="出力フォルダ", **lbl_style).grid(
-            row=3, column=0, sticky="w", **cell
-        )
-        out_row = ctk.CTkFrame(settings, fg_color="transparent")
-        out_row.grid(row=3, column=1, sticky="ew", **cell)
+        add_label(basic, "出力フォルダ", 2)
+        out_row = ctk.CTkFrame(basic, fg_color="transparent")
+        out_row.grid(row=2, column=1, sticky="ew", **cell)
         self.out_entry = ctk.CTkEntry(
             out_row,
             height=32,
@@ -406,51 +498,44 @@ class InstantClipApp(ctk.CTk):
             command=self._pick_output,
         ).pack(side="left", padx=(6, 0))
 
-        ctk.CTkLabel(settings, text="FPS", **lbl_style).grid(
-            row=4, column=0, sticky="w", **cell
-        )
-        self.fps_spin = ctk.CTkEntry(
-            settings, width=90, height=32, corner_radius=CORNER_SM,
-            fg_color=CARD_ALT, border_color=BORDER, text_color=TEXT,
-        )
-        self.fps_spin.grid(row=4, column=1, sticky="w", **cell)
+        add_label(basic, "保存の通知", 3)
+        self.notify_menu = add_menu(basic, [x[0] for x in NOTIFY_MODES], 3)
 
-        ctk.CTkLabel(settings, text="音声デバイス", **lbl_style).grid(
-            row=5, column=0, sticky="w", **cell
-        )
+        self.chk_autostart = add_check(basic, "Windows 起動時に開始（トレイに常駐）", 4)
+        if autostart.is_enabled():
+            self.chk_autostart.select()
+
+        # ── 映像
+        add_label(video, "キャプチャ", 0)
+        self.capture_menu = add_menu(video, [x[0] for x in CAPTURE_MODES], 0)
+
+        add_label(video, "モニタ", 1)
+        self._monitor_choices = _monitor_choices()
+        self.monitor_menu = add_menu(video, [x[0] for x in self._monitor_choices], 1)
+
+        add_label(video, "FPS", 2)
+        self.fps_spin = add_entry(video, 2)
+
+        add_label(video, "画質", 3)
+        self._quality_choices = list(QUALITY_CHOICES)
+        self.quality_menu = add_menu(video, [x[0] for x in self._quality_choices], 3)
+
+        add_label(video, "CPU エンコード", 4)
+        self._preset_choices = list(PRESET_CHOICES)
+        self.preset_menu = add_menu(video, [x[0] for x in self._preset_choices], 4)
+
+        # ── 音声
+        add_label(audio, "音声デバイス", 0)
         self._audio_device_choices = [_NO_AUDIO] + get_loopback_devices()
-        self.audio_menu = ctk.CTkOptionMenu(
-            settings,
-            values=self._audio_device_choices,
-            height=32,
-            corner_radius=CORNER_SM,
-            fg_color=CARD_ALT,
-            button_color=SECONDARY,
-            button_hover_color=BORDER,
-            dropdown_fg_color=CARD,
-            dropdown_hover_color=SECONDARY,
-            text_color=TEXT,
-        )
-        self.audio_menu.grid(row=5, column=1, sticky="ew", **cell)
+        self.audio_menu = add_menu(audio, self._audio_device_choices, 0, sticky="ew")
 
-        opts = ctk.CTkFrame(settings, fg_color="transparent")
-        opts.grid(row=6, column=0, columnspan=2, sticky="ew", padx=12, pady=(4, 10))
-        self.chk_auto_route = ctk.CTkCheckBox(
-            opts,
-            text="VB-Cable: ゲーム起動時に自動切替",
-            font=self._font(12),
-            text_color=TEXT,
-            fg_color=ACCENT,
-            hover_color=ACCENT_HOVER,
-            border_color=BORDER,
-        )
-        self.chk_auto_route.pack(anchor="w", pady=2)
+        self.chk_auto_route = add_check(audio, "VB-Cable: ゲーム起動時に自動切替", 1)
         ctk.CTkLabel(
-            opts,
+            audio,
             text="※ VB-Cable のインストールが必要です",
             font=self._font(11),
             text_color=MUTED,
-        ).pack(anchor="w", pady=(4, 0))
+        ).grid(row=2, column=0, columnspan=2, sticky="w", padx=12)
 
         actions = self._card(self)
         actions.pack(fill="x", padx=PAD, pady=6)
@@ -498,49 +583,96 @@ class InstantClipApp(ctk.CTk):
         self.log_box.pack(fill="both", expand=True, padx=10, pady=(0, 10))
 
     def _apply_cfg_to_ui(self):
-        self.buffer_spin.insert(0, str(self.cfg.get("buffer_seconds", 10)))
-        self.fps_spin.insert(0, str(self.cfg.get("framerate", 30)))
         out = self.cfg.get("output_dir") or str(cfg_mod.default_output_dir())
-        self.out_entry.insert(0, out)
+        for entry, value in (
+            (self.buffer_spin, self.cfg.get("buffer_seconds", 10)),
+            (self.fps_spin, self.cfg.get("framerate", 30)),
+            (self.out_entry, out),
+        ):
+            entry.delete(0, "end")
+            entry.insert(0, str(value))
 
-        vk, mod = self.cfg.get("hotkey_vk", 0x78), self.cfg.get("hotkey_mod", 0)
-        for label, v, m in HOTKEY_CHOICES:
-            if v == vk and m == mod:
-                self.hotkey_menu.set(label)
-                break
+        self._hotkey_choice = (
+            self.cfg.get("hotkey_vk", 0x78),
+            self.cfg.get("hotkey_mod", 0),
+        )
+        self.hotkey_btn.configure(text=combo_label(*self._hotkey_choice))
 
-        mode = self.cfg.get("capture_mode", "auto")
-        for label, val in CAPTURE_MODES:
-            if val == mode:
-                self.capture_menu.set(label)
-                break
+        self.capture_menu.set(
+            _label_for(CAPTURE_MODES, self.cfg.get("capture_mode", "auto"), CAPTURE_MODES[0][0])
+        )
+        self.monitor_menu.set(
+            _label_for(
+                self._monitor_choices,
+                self.cfg.get("monitor", "primary"),
+                self._monitor_choices[0][0],
+            )
+        )
+        self.notify_menu.set(
+            _label_for(NOTIFY_MODES, self.cfg.get("notify", "sound"), NOTIFY_MODES[0][0])
+        )
+        self._set_custom_menu(self.quality_menu, self._quality_choices, self.cfg.get("crf", 23))
+        self._set_custom_menu(
+            self.preset_menu, self._preset_choices, self.cfg.get("preset", "ultrafast")
+        )
 
         audio_name = self.cfg.get("audio_device_name", "")
-        if not audio_name and self.cfg.get("game_audio_only"):
-            vb = audio_routing.find_vbcable_loopback_name()
-            if vb:
-                audio_name = vb
         if audio_name in self._audio_device_choices:
             self.audio_menu.set(audio_name)
         else:
             self.audio_menu.set(_NO_AUDIO)
         if self.cfg.get("auto_route_audio"):
             self.chk_auto_route.select()
+        else:
+            self.chk_auto_route.deselect()
+
+    def _set_custom_menu(self, menu: ctk.CTkOptionMenu, choices: list, value) -> None:
+        """選択肢に無い値（config.json を直接編集した場合）は「カスタム」として追加して選ぶ。"""
+        if _label_for(choices, value) is None:
+            choices.append((f"カスタム ({value})", value))
+            menu.configure(values=[label for label, _ in choices])
+        menu.set(_label_for(choices, value))
+
+    def _begin_hotkey_capture(self):
+        """ホットキー欄クリック: 次に押されたキーの組み合わせをホットキー候補にする。"""
+        if self._capturing_hotkey:
+            return
+        self._capturing_hotkey = True
+        self.hotkey_btn.configure(text="キーを押してください（Esc で取消）")
+        self.focus_set()
+        self._hotkey_bind_id = self.bind("<KeyPress>", self._on_hotkey_capture_key)
+
+    def _end_hotkey_capture(self):
+        self._capturing_hotkey = False
+        if self._hotkey_bind_id:
+            self.unbind("<KeyPress>", self._hotkey_bind_id)
+            self._hotkey_bind_id = None
+        self.hotkey_btn.configure(text=combo_label(*self._hotkey_choice))
+
+    def _on_hotkey_capture_key(self, event):
+        vk = event.keycode  # Windows では仮想キーコード
+        if vk in MODIFIER_VKS:
+            return "break"
+        if vk == win32con.VK_ESCAPE:
+            self._end_hotkey_capture()
+            return "break"
+        mod = 0
+        if event.state & _TK_CONTROL:
+            mod |= win32con.MOD_CONTROL
+        if event.state & _TK_ALT:
+            mod |= win32con.MOD_ALT
+        if event.state & _TK_SHIFT:
+            mod |= win32con.MOD_SHIFT
+        if not mod and not is_standalone_key(vk):
+            self._log("[警告] このキーは Ctrl / Alt / Shift と組み合わせて指定してください")
+            return "break"
+        self._hotkey_choice = (vk, mod)
+        self._end_hotkey_capture()
+        self._log(f"ホットキー候補: {combo_label(vk, mod)}（「設定を保存」で反映）")
+        return "break"
 
     def _collect_cfg(self) -> dict:
-        label = self.hotkey_menu.get()
-        vk, mod = 0x78, 0
-        for l, v, m in HOTKEY_CHOICES:
-            if l == label:
-                vk, mod = v, m
-                break
-
-        cap_label = self.capture_menu.get()
-        capture_mode = "auto"
-        for l, v in CAPTURE_MODES:
-            if l == cap_label:
-                capture_mode = v
-                break
+        vk, mod = self._hotkey_choice
 
         try:
             buffer_seconds = int(self.buffer_spin.get().strip())
@@ -559,16 +691,34 @@ class InstantClipApp(ctk.CTk):
             "buffer_seconds": buffer_seconds,
             "hotkey_vk": vk,
             "hotkey_mod": mod,
-            "capture_mode": capture_mode,
+            "capture_mode": _value_for(CAPTURE_MODES, self.capture_menu.get(), "auto"),
+            "monitor": _value_for(self._monitor_choices, self.monitor_menu.get(), "primary"),
             "output_dir": self.out_entry.get().strip(),
             "framerate": framerate,
             "audio_device_name": audio_name,
             "game_audio_only": bool(audio_name),
             "auto_route_audio": bool(self.chk_auto_route.get()),
+            "notify": _value_for(NOTIFY_MODES, self.notify_menu.get(), "sound"),
             "game_exe": self.cfg.get("game_exe", "th123.exe"),
-            "crf": self.cfg.get("crf", 23),
-            "preset": self.cfg.get("preset", "ultrafast"),
+            "crf": _value_for(self._quality_choices, self.quality_menu.get(), 23),
+            "preset": _value_for(self._preset_choices, self.preset_menu.get(), "ultrafast"),
         }
+
+    def _apply_autostart(self):
+        """チェックボックスの状態をタスクスケジューラへ反映する。"""
+        want = bool(self.chk_autostart.get())
+        if want == autostart.is_enabled():
+            return
+        ok, err = autostart.set_enabled(want)
+        if ok:
+            self._log("Windows 起動時の自動開始を" + ("登録しました" if want else "解除しました"))
+            return
+        self._log(f"[警告] 自動開始の設定に失敗しました: {err}")
+        if want:
+            self._log("  管理者として起動した InstantClip から設定してください")
+            self.chk_autostart.deselect()
+        else:
+            self.chk_autostart.select()
 
     def _save_settings(self):
         prev = dict(self.cfg)
@@ -576,14 +726,21 @@ class InstantClipApp(ctk.CTk):
         cfg_mod.save(self.cfg)
         _audio_dev = self.cfg.get("audio_device_name", "")
         _is_vb = any(kw in _audio_dev for kw in _VB_KEYWORDS)
-        self._router.enabled = _is_vb and bool(self.cfg.get("auto_route_audio"))
+        route_enabled = _is_vb and bool(self.cfg.get("auto_route_audio"))
+        if not route_enabled:
+            self._router.restore()
+        self._router.enabled = route_enabled
         self._router.game_exe = self.cfg["game_exe"]
         self._reregister_hotkey()
+        self._apply_autostart()
         self._log("設定を保存しました")
         buffer_keys = (
             "buffer_seconds",
             "capture_mode",
+            "monitor",
             "framerate",
+            "crf",
+            "preset",
             "game_exe",
             "audio_device_name",
             "game_audio_only",
@@ -623,6 +780,7 @@ class InstantClipApp(ctk.CTk):
             preset=self.cfg.get("preset", "ultrafast"),
             audio_device=audio_dev,
             log=self._log,
+            monitor=self.cfg.get("monitor", "primary"),
         )
         global _active_buffer
         _active_buffer = self.buffer
@@ -659,6 +817,8 @@ class InstantClipApp(ctk.CTk):
 
     def _on_hotkey(self):
         """任意スレッドから呼ばれる。Tk を経由せず直接保存ワーカーを起動する。"""
+        if self._capturing_hotkey:
+            return
         with self._hotkey_lock:
             now = time.time()
             if now - self._last_hotkey_at < 0.8:
@@ -674,6 +834,8 @@ class InstantClipApp(ctk.CTk):
 
     def _save_clip_worker(self, out_dir: Path):
         if not self.buffer:
+            self.log_q.put("[警告] バッファが動作していません")
+            self._notify_save(False)
             return
         try:
             if not self.buffer._capture_ok or not self.buffer._proc_alive():
@@ -682,8 +844,26 @@ class InstantClipApp(ctk.CTk):
             if path:
                 self._last_clip_path = path
                 self.log_q.put(f"✓ 保存完了: {path.name}")
+            self._notify_save(path is not None, path.name if path else "")
         except Exception as e:
             self.log_q.put(f"[エラー] クリップ保存中に例外: {e}")
+            self._notify_save(False)
+
+    def _notify_save(self, ok: bool, name: str = "") -> None:
+        """保存結果をゲーム中でも分かるように知らせる（ワーカースレッドから呼ばれる）。"""
+        mode = self.cfg.get("notify", "sound")
+        try:
+            if mode == "sound":
+                if ok:
+                    winsound.Beep(880, 90)
+                    winsound.Beep(1320, 120)
+                else:
+                    winsound.Beep(330, 300)
+            elif mode == "toast" and self._tray_icon:
+                text = f"クリップを保存しました: {name}" if ok else "クリップを保存できませんでした"
+                self._tray_icon.notify(text, APP_TITLE)
+        except Exception:
+            pass
 
     def _open_trim(self):
         init_dir = str(self.cfg.get("output_dir") or cfg_mod.default_output_dir())
@@ -793,6 +973,11 @@ class InstantClipApp(ctk.CTk):
 
         self._stop_buffer()
 
+        try:
+            self._router.restore()
+        except Exception:
+            pass
+
         if self._tray_icon:
             try:
                 self._tray_icon.stop()
@@ -806,7 +991,28 @@ class InstantClipApp(ctk.CTk):
             pass
 
 
+_single_instance_mutex = None
+
+
+def _already_running() -> bool:
+    """名前付きミューテックスで二重起動を検出する。ハンドルは終了まで保持する。"""
+    global _single_instance_mutex
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.CreateMutexW.restype = ctypes.c_void_p
+    _single_instance_mutex = kernel32.CreateMutexW(None, False, "Local\\InstantClip_SingleInstance")
+    return ctypes.get_last_error() == 183  # ERROR_ALREADY_EXISTS
+
+
 def main():
+    if _already_running():
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo(
+            APP_TITLE,
+            "InstantClip は既に起動しています。\n"
+            "タスクバーの通知領域（トレイ）のアイコンから表示できます。",
+        )
+        return
     if not find_ffmpeg():
         root = tk.Tk()
         root.withdraw()
@@ -816,7 +1022,7 @@ def main():
             "instant_clip/ffmpeg/ffmpeg.exe を配置してください。",
         )
         return
-    app = InstantClipApp()
+    app = InstantClipApp(start_hidden=autostart.TRAY_ARG in sys.argv)
     app.mainloop()
 
 

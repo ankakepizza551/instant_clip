@@ -17,11 +17,17 @@ def ensure_user_can_access(path: Path) -> None:
         dacl = sd.GetSecurityDescriptorDacl()
         if dacl is None:
             dacl = win32security.ACL()
-        dacl.AddAccessAllowedAce(
-            win32security.ACL_REVISION,
-            con.FILE_GENERIC_READ | con.FILE_GENERIC_WRITE | con.DELETE,
-            user,
-        )
+        wanted = con.FILE_GENERIC_READ | con.FILE_GENERIC_WRITE | con.DELETE
+        # 既に同じ許可があれば追加しない（保存のたびに ACE が増えるのを防ぐ）
+        for i in range(dacl.GetAceCount()):
+            (ace_type, _flags), mask, sid = dacl.GetAce(i)[:3]
+            if (
+                ace_type == win32security.ACCESS_ALLOWED_ACE_TYPE
+                and sid == user
+                and mask & wanted == wanted
+            ):
+                return
+        dacl.AddAccessAllowedAce(win32security.ACL_REVISION, wanted, user)
         sd.SetSecurityDescriptorDacl(1, dacl, 0)
         win32security.SetFileSecurity(str(path), win32security.DACL_SECURITY_INFORMATION, sd)
     except Exception:
