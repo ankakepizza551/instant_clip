@@ -6,7 +6,7 @@ import sys
 from pathlib import Path
 
 APP_NAME = "InstantClip"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 
 DEFAULTS: dict = {
     "buffer_seconds": 10,
